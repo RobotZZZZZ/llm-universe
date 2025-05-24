@@ -1,18 +1,23 @@
+## 使用 chainlit 框架实现流式输出
+## 运行命令
+## chainlit run my_codes/ui_app.py
+## 停止命令
+## pkill -f "chainlit run"
+
 import os
 import sys
 
-import streamlit as st
+import chainlit
 
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableBranch, RunnablePassthrough
+from langchain_core.runnables import RunnableBranch, RunnablePassthrough, RunnableLambda
 from langchain_community.vectorstores import Chroma
 
 from dotenv import load_dotenv, find_dotenv
 
 from ark_embedding import ArkEmbeddings
-
 
 _ = load_dotenv(find_dotenv('.env.local'))
 
@@ -21,8 +26,7 @@ required_vars = ["DEEPSEEK_API_KEY", "DEEPSEEK_API_URL", "DEEPSEEK_MODEL",
                  "ARK_API_KEY", "ARK_API_URL", "ARK_EMBEDDING_MODEL"]
 missing_vars = [var for var in required_vars if not os.getenv(var)]
 if missing_vars:
-    st.error(f"缺少环境变量: {', '.join(missing_vars)}")
-    st.stop()
+    raise ValueError(f"缺少环境变量: {', '.join(missing_vars)}")
 
 # 设置大模型参数
 api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -38,7 +42,7 @@ def get_retriever():
     获取向量数据库的检索器
 
     Returns:
-        vectordb: 向量数据库的检索器
+        retriever: 向量数据库的检索器
     """
     # 初始化 Embeddings
     embedding = ArkEmbeddings(
@@ -56,7 +60,9 @@ def get_retriever():
         embedding_function=embedding,
     )
 
-    return vectordb
+    # 将向量数据库转换为检索器
+    retriever = vectordb.as_retriever()
+    return retriever
 
 def combine_docs(docs):
     """
@@ -99,11 +105,11 @@ def get_qa_history_chain():
         ("human", "{input}")
     ])
 
-    # 构造“总结历史信息”的检索文档的处理链
+    # 构造"总结历史信息"的检索文档的处理链
     # RunnableBranch 会根据条件选择要运行的分支
     retrieve_docs = RunnableBranch(
         # 分支 1: 若聊天记录中没有 chat_history 则直接使用用户问题查询向量数据库
-        (lambda x: not x.get("chat_history", ""), (lambda x: x["input"]) | retriever, ),
+        (lambda x: not x.get("chat_history", ""), RunnableLambda(lambda x: x["input"]) | retriever, ),
         # 分支 2 : 若聊天记录中有 chat_history 则先让 llm 根据聊天记录完善问题再查询向量数据库
         condense_question_prompt | llm | StrOutputParser() | retriever,
     )
@@ -127,7 +133,7 @@ def get_qa_history_chain():
         ]
     )
 
-    # 定义“整合知识库”的问答链
+    # 定义"整合知识库"的问答链
     # 1. 整合知识库信息进入context
     # 2. 拼装prompt, 整合context和chat_history进入qa_chain
     # 3. 请求llm
@@ -168,35 +174,58 @@ def gen_response(chain, input, chat_history):
         if "answer" in res.keys():
             yield res["answer"]
 
-def main():
-    st.markdown("### 🦜🔗 动手学大模型应用开发")
-    # st.session_state可以存储用户与应用交互期间的状态与数据
-    # 存储对话历史
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    # 存储检索问答链
-    if "qa_history_chain" not in st.session_state:
-        st.session_state.qa_history_chain = get_qa_history_chain()
-    # 建立窗口 高度为500 px
-    messages = st.container(height=550)
-    # 显示整个对话历史
-    for message in st.session_state.messages:
-        with messages.chat_message(message[0]):
-            st.write(message[1])
-    if prompt := st.chat_input("Say something"):
-        # 显示当前用户输入
-        with messages.chat_message("user"):
-            st.write(prompt)
-        # 生成回复
-        answer = gen_response(
-            chain=st.session_state.qa_history_chain,
-            input=prompt,
-            chat_history=st.session_state.messages,
-        )
-        # 将用户输入添加到对话历史中
-        st.session_state.messages.append(("user", prompt))
-        # 流式输出
-        with messages.chat_message("assistant"):
-            output = st.write_stream(answer)
-        # 将输出存入st.session_state.messages
-        st.session_state.messages.append(("assistant", output))
+@chainlit.on_chat_start
+async def start():
+    """
+    在聊天开始时初始化
+    """
+    # 初始化问答链
+    qa_history_chain = get_qa_history_chain()
+    
+    # 将问答链存储到用户会话中
+    chainlit.user_session.set("qa_history_chain", qa_history_chain)
+    chainlit.user_session.set("messages", [])
+    
+    await chainlit.Message(content="你好！我是基于知识库的问答助手，请问有什么问题吗？").send()
+
+@chainlit.on_message
+async def main(message: chainlit.Message):
+    """
+    处理用户消息
+    """
+    # 获取用户会话中的问答链和历史消息
+    qa_history_chain = chainlit.user_session.get("qa_history_chain")
+    messages = chainlit.user_session.get("messages", [])
+    
+    # 获取用户输入
+    user_input = message.content
+    
+    # 准备响应消息
+    msg = chainlit.Message(content="")
+    await msg.send()
+    
+    # 生成回复（流式输出）
+    response_text = ""
+    
+    # 获取流式响应
+    response_stream = qa_history_chain.stream({
+        "input": user_input,
+        "chat_history": messages
+    })
+    
+    for chunk in response_stream:
+        if "answer" in chunk:
+            # 获取增量内容
+            chunk_content = chunk["answer"]
+            response_text += chunk_content
+            
+            # 更新消息内容
+            msg.content = response_text
+            await msg.update()
+    
+    # 将对话添加到历史记录
+    messages.append(("user", user_input))
+    messages.append(("assistant", response_text))
+    
+    # 更新用户会话
+    chainlit.user_session.set("messages", messages)
